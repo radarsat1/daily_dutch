@@ -83,6 +83,12 @@ port = 54324
 
 [functions.generate-quiz]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/generate-quiz/deno.json"
 entrypoint = "./functions/generate-quiz/index.ts"
+
+[functions.save-quiz]
+enabled = true
+verify_jwt = false
+import_map = "./functions/save-quiz/deno.json"
+entrypoint = "./functions/save-quiz/index.ts"

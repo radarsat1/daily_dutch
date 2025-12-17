@@ -1,3 +1,11 @@
 {
-  "imports": {}
+  "imports": {
+    "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.39.3",
+    "@langchain/core": "npm:@langchain/core@1.1.6",
+    "@langchain/google-genai": "npm:@langchain/google-genai@2.1.1",
+    "@langchain/openai": "npm:@langchain/openai@1.2.0",
+    "@langchain/langgraph": "npm:@langchain/langgraph@1.0.7",
+    "zod": "https://esm.sh/zod@3.23.8",
+    "cheerio": "https://esm.sh/cheerio@1.0.0-rc.12"
+  }
 }
