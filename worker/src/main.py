@@ -22,10 +22,12 @@ from langchain_core.prompt_values import ChatPromptValue
 app = FastAPI(title="Quiz Worker")
 
 # --- Pydantic Models for API ---
-from typing import Any
 class QuizRequest(BaseModel):
     prompt: dict # ChatPromptValue
-    quiz_id: int | None
+    quiz_id: int
+    user_id: str
+    webhook: str
+    user_token: str
 
 class QuizQuestion(BaseModel):
     question: str
@@ -57,6 +59,24 @@ async def generate_quiz(request: QuizRequest):
             for m in request.prompt['kwargs']['messages']
         ]
         result = llm.invoke(messages)
+
+        # Send webhook to save the results
+        async with httpx.AsyncClient() as client:
+            print(result.model_dump()['exercises'])
+            response = await client.post(
+                request.webhook,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + request.user_token,
+                },
+                json={
+                    'user_id': request.user_id,
+                    'quiz_id': request.quiz_id,
+                    'questions': result.model_dump()['exercises']
+                }
+            )
+            print(response.json())
+
         return result
     except Exception as e:
         print(e)

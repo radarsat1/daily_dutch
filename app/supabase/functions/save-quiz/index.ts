@@ -4,6 +4,7 @@ const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 Deno.serve(async (req) => {
+  console.log('save-quiz:', req);
   // CORS
   if (req.method === "OPTIONS") {
     return new Response("ok", {
@@ -54,36 +55,58 @@ Deno.serve(async (req) => {
       throw new Error("Invalid payload: 'questions' must be an array.");
     }
 
-    // 1. Insert Quiz (Questions go into 'content' JSONB column)
-    const { data: quiz, error: quizError } = await supabase
-      .from("quizzes")
-      .insert({
-        user_id: user.id,
-        context: payload.context,
-        content: payload.questions, // Direct JSON save
-        status: "ready"
-      })
-      .select()
-      .single();
+    if (payload.quiz_id) {
+      // Update Quiz (Questions go into 'content' JSONB column)
+      const { data: quiz, error: quizError } = await supabase
+        .from("quizzes")
+        .update({
+          content: payload.questions,
+          status: payload.status
+        })
+        .eq("id", payload.quiz_id)
+        .select()
+        .single();
+      if (quizError) throw quizError;
 
-    if (quizError) throw quizError;
-
-    // 2. Link Word Lists (Optional)
-    if (payload.word_list_ids && Array.isArray(payload.word_list_ids)) {
-      const links = payload.word_list_ids.map((id: number) => ({
-        quiz_id: quiz.id,
-        word_list_id: id,
-      }));
-      await supabase.from("quiz_word_lists").insert(links);
+      return new Response(
+        JSON.stringify({ message: "Quiz updated", quiz_id: quiz.id }),
+        {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+          status: 200
+        }
+      );
     }
+    else {
+      // Insert Quiz (Questions go into 'content' JSONB column)
+      const { data: quiz, error: quizError } = await supabase
+        .from("quizzes")
+        .insert({
+          user_id: user.id,
+          context: payload.context,
+          content: payload.questions,
+          status: "ready"
+        })
+        .select()
+        .single();
+      if (quizError) throw quizError;
 
-    return new Response(
-      JSON.stringify({ message: "Quiz saved", quiz_id: quiz.id }),
-      {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        status: 200
+      // 2. Link Word Lists
+      if (payload.word_list_ids && Array.isArray(payload.word_list_ids)) {
+        const links = payload.word_list_ids.map((id: number) => ({
+          quiz_id: quiz.id,
+          word_list_id: id,
+        }));
+        await supabase.from("quiz_word_lists").insert(links);
       }
-    );
+
+      return new Response(
+        JSON.stringify({ message: "Quiz saved", quiz_id: quiz.id }),
+        {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+          status: 200
+        }
+      );
+    }
 
   } catch (err: any) {
     return new Response(JSON.stringify({ error: err.message }), {
