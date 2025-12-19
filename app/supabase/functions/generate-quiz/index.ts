@@ -1,26 +1,23 @@
 import { createClient } from "@supabase/supabase-js";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatOpenAI } from "@langchain/openai";
-import { EdgeOpenAI } from "./EdgeOpenAI.ts";
-import { StateGraph } from "@langchain/langgraph";
+import { StateGraph, Command, interrupt } from "@langchain/langgraph";
 import { SupabaseSaver } from "./SupabaseSaver.ts";
-import { JsonOutputParser } from "@langchain/core/output_parsers";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
 import * as cheerio from "cheerio";
 import { z } from "zod";
 
 // --- Config ---
 const NUM_SENTENCES = 10;
+const WORKER_URL = 'http://host.docker.internal:3001/generate_quiz';
+const MAX_WAIT_MINUTES = 5;
 
-// Helper to get an LLM.
+// Helper to get an LLM (Used only for formatting prompt now, or can be removed if prompt is purely string based)
 function getLLM() {
   const provider = (Deno.env.get("LLM_PROVIDER") || "google").toLowerCase();
   const modelName = Deno.env.get("LLM_MODEL") || "gemini-2.5-flash";
   const temperature = 0.7;
 
-  console.log(`Initializing LLM: ${provider} (${modelName})`);
-
-  // 1. Google Gemini
   if (provider.includes("google") || provider.includes("gemini")) {
     return new ChatGoogleGenerativeAI({
       model: modelName,
@@ -29,12 +26,8 @@ function getLLM() {
     });
   }
 
-  // 2. OpenAI / OpenRouter / Local
-  // These all share the OpenAI API signature
   const apiKey = Deno.env.get("LLM_API_KEY") || "dummy-key";
   let baseUrl = Deno.env.get("LLM_BASE_URL");
-
-  // Auto-configure URL defaults if not provided
   if (!baseUrl) {
     if (provider === "openrouter") baseUrl = "https://openrouter.ai/api/v1";
     if (provider === "local") baseUrl = "http://host.docker.internal:1234/v1";
@@ -55,16 +48,15 @@ interface QuizQuestion {
   english: string;
 }
 
-// Version of the above for structured output
 const QuizSchema = z.array(z.object({
-  question: z.string().describe("The Dutch sentence"),
-  answer: z.string().describe("The missing Dutch word"),
-  english: z.string().describe("The English translation"),
+  question: z.string(),
+  answer: z.string(),
+  english: z.string(),
 }));
 
 interface AgentState {
   // Inputs
-  user_token: string; // Passed to allow RLS-compliant DB calls inside nodes
+  user_token: string;
   user_id: string;
   word_list_ids: number[];
 
@@ -74,50 +66,53 @@ interface AgentState {
   article_title?: string;
   article_text?: string;
 
+  // Job Data
+  quiz_id?: number;
+
   // Output
   generated_quiz?: QuizQuestion[];
-  quiz_id?: number;
   error?: string;
+}
+
+// --- Supabase Helpers ---
+const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const supabaseGlobal = createClient(supabaseUrl, supabaseKey);
+const checkpointer = new SupabaseSaver(supabaseGlobal);
+
+function supabaseClient(user_token: string) {
+  return createClient(supabaseUrl, supabaseKey, {
+    global: { headers: { Authorization: `Bearer ${user_token}` } },
+    auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
+  });
 }
 
 // --- Node Functions ---
 
 async function fetchWordsNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.error) {
-    console.log(state.error);
-    return {};
-  }
+  if (state.error) return {};
   console.log("--- Step 1: Fetching Target Words ---");
 
-  // Use User Token to respect RLS
   const supabase = supabaseClient(state.user_token);
 
   if (!state.word_list_ids || state.word_list_ids.length === 0) {
     return { target_words: ["nieuws", "vandaag", "belangrijk"] };
   }
 
-  // Fetch from the JSONB 'words' column
   const { data, error } = await supabase
     .from("word_lists")
     .select("words")
     .in("id", state.word_list_ids);
 
   if (error) return { error: `DB Error: ${error.message}` };
-
-  // Flatten the arrays: data is [{ words: ["a", "b"] }, { words: ["c"] }]
   const allWords: string[] = data.flatMap((row: any) => row.words || []);
-
-  // Dedup
   const uniqueWords = [...new Set(allWords)];
 
   return { target_words: uniqueWords.length > 0 ? uniqueWords : ["general"] };
 }
 
 async function pickArticleNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.error) {
-    console.log(state.error);
-    return {};
-  }
+  if (state.error) return {};
   console.log("--- Step 2: Picking Article ---");
 
   try {
@@ -132,22 +127,15 @@ async function pickArticleNode(state: AgentState): Promise<Partial<AgentState>> 
     });
 
     if (links.length === 0) return { error: "No articles found" };
-
-    const uniqueLinks = [...new Set(links)];
-    const selectedPath = uniqueLinks[Math.floor(Math.random() * uniqueLinks.length)];
-    const fullUrl = `https://nos.nl${selectedPath}`;
-
-    return { article_url: fullUrl };
+    const selectedPath = links[Math.floor(Math.random() * links.length)];
+    return { article_url: `https://nos.nl${selectedPath}` };
   } catch (e: any) {
     return { error: e.message };
   }
 }
 
 async function scrapeContentNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.error || !state.article_url) {
-    console.log(state.error);
-    return {};
-  }
+  if (state.error || !state.article_url) return {};
   console.log(`--- Step 3: Scraping ${state.article_url} ---`);
 
   try {
@@ -156,14 +144,11 @@ async function scrapeContentNode(state: AgentState): Promise<Partial<AgentState>
     const $ = cheerio.load(html);
 
     const title = $("title").text().replace(" | NOS", "").trim();
-
     let paragraphs = $("article p");
     if (paragraphs.length === 0) paragraphs = $("p");
 
     const textParts: string[] = [];
-    paragraphs.each((_, el) => {
-      textParts.push($(el).text());
-    });
+    paragraphs.each((_, el) => textParts.push($(el).text()));
 
     return {
       article_text: textParts.join(" ").slice(0, 8000),
@@ -174,15 +159,13 @@ async function scrapeContentNode(state: AgentState): Promise<Partial<AgentState>
   }
 }
 
-async function generateQuizNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.error || !state.article_url) {
-    console.log(state.error);
-    return {};
-  }
-  console.log("--- Step 4: Generating Quiz (Gemini) ---");
+async function triggerWorkerNode(state: AgentState): Promise<Partial<AgentState>> {
+  if (state.error || !state.article_text) return {};
+  console.log("--- Step 4: Creating Quiz Job & Triggering Worker ---");
 
-  const llm = getLLM().withStructuredOutput(QuizSchema);
+  const supabase = supabaseClient(state.user_token);
 
+  // 1. Prepare Prompt Payload (We don't call LLM here, just format)
   const promptText = `
     You are a Dutch language teacher creating exercises.
 
@@ -202,100 +185,118 @@ async function generateQuizNode(state: AgentState): Promise<Partial<AgentState>>
 
     FORMAT EXAMPLE:
     [
-      {{"sentence": "Het schrijven van een brief is een lastige klus.", "answer": "klus", "english", "Writing a letter is a difficult task."}},
+      {{"sentence": "Het schrijven van een brief is een lastige klus.", "answer": klus", "english", "Writing a letter is a difficult task."}},
       ...
     ]
   `;
 
-  const prompt = ChatPromptTemplate.fromTemplate(promptText);
-  const chain = prompt.pipe(llm);
+  const prompt = await ChatPromptTemplate.fromTemplate(promptText).invoke({
+    article_text: state.article_text,
+    target_words: state.target_words.join(", "),
+    num_sentences: NUM_SENTENCES,
+    subset_sentences: parseInt(NUM_SENTENCES*3/4),
+  });
 
-  try {
-    const result = await prompt.invoke({
-      article_text: state.article_text,
-      target_words: state.target_words.join(", "),
-      num_sentences: NUM_SENTENCES,
-      subset_sentences: parseInt(NUM_SENTENCES*3/4),
-    });
-
-    // Make a request to our worker service to call the LLM on our behalf
-    const result2 = await fetch('http://host.docker.internal:3001/generate_quiz', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({'prompt': result.toJSON(), 'quiz_id': 0})  // TODO quiz_id
-    });
-
-    // TODO: interrupt LangGraph here and return, allow the client to resume the graph at
-    // this point once the worker has written to the database. Note that this will require
-    // writing an empty quiz to the database first in order to get a quiz_id, then we'll
-    // expect the worker to fill it in. (Or we could do that through an authenticated edge
-    // function.)
-
-    return { generated_quiz: await result2.json() as QuizQuestion[] };
-  } catch (e: any) {
-    return { error: e.message };
-  }
-}
-
-async function saveToDbNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.error || !state.article_url) {
-    console.log(state.error);
-    return {};
-  }
-  console.log("--- Step 5: Saving to DB ---");
-
-  // Re-initialize client with user token for RLS
-  const supabase = supabaseClient(state.user_token);
-
-  // 1. Insert Quiz (Content is JSONB)
+  // 2. Insert Placeholder Quiz in DB
   const { data: quiz, error: quizError } = await supabase
     .from("quizzes")
     .insert({
-      user_id: state.user_id, // RLS will also check auth.uid()
+      user_id: state.user_id,
       context: {
         title: state.article_title,
         url: state.article_url,
         type: 'article'
       },
-      content: state.generated_quiz,
-      status: "ready"
+      content: null, // Worker will fill this
+      status: "generating"
     })
     .select("id")
     .single();
 
-  if (quizError) console.log(quizError);
   if (quizError) return { error: quizError.message };
+  console.log('new quiz:', quiz);
 
-  // 2. Link Word Lists (Optional)
-  if (state.word_list_ids && state.word_list_ids.length > 0) {
-    const links = state.word_list_ids.map(id => ({
-      quiz_id: quiz.id,
-      word_list_id: id
-    }));
-    await supabase.from("quiz_word_lists").insert(links);
+  // 3. Call External Worker
+  try {
+    console.log(`Triggering worker for quiz_id: ${quiz.id}`);
+    const workerResp = await fetch(WORKER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt: prompt,
+        quiz_id: quiz.id
+      })
+    });
+
+    if (!workerResp.ok) throw new Error(`Worker returned ${workerResp.status}`);
+
+  } catch (e: any) {
+    return { error: `Failed to call worker: ${e.message}` };
   }
 
   return { quiz_id: quiz.id };
 }
 
-// --- Graph Setup ---
-const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const supabase = createClient(supabaseUrl, supabaseKey);
-const checkpointer = new SupabaseSaver(supabase);
+// checks DB, updates state, returns
+async function checkStatusNode(state: AgentState): Promise<Partial<AgentState>> {
+  console.log(`--- Checking Status for Quiz ${state.quiz_id} ---`);
+  
+  const supabase = supabaseClient(state.user_token);
+  const { data, error } = await supabase
+    .from("quizzes")
+    .select("content, status, created_at")
+    .eq("id", state.quiz_id)
+    .single();
 
-function supabaseClient(user_token) {
-  return createClient(supabaseUrl, supabaseKey, {
-    global: { headers: { Authorization: `Bearer ${user_token}` } },
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-      detectSessionInUrl: false,
-    },
-  });
+  if (error) return { error: error.message };
+  
+  // If content is ready
+  if (data.content !== null) {
+    return { generated_quiz: data.content };
+  }
+  
+  // If error or timeout, handle logic here...
+  if (data.status === 'error') return { error: "Worker error" };
+
+  // If still waiting, we return NOTHING different. 
+  // The state remains generated_quiz: undefined.
+  return {}; 
 }
+
+// handles the pause so that if we resume here we don't have to re-execute the query, we
+// rely on the graph to cycle back to check_status for that.
+function waitNode(state: AgentState) {
+    console.log("--- Pause: Waiting for Client/Worker ---");
+    // This value is returned when the client calls resume
+    interrupt("Waiting for external worker...");
+    return {};
+}
+
+async function finalizeQuizNode(state: AgentState): Promise<Partial<AgentState>> {
+  if (state.error) return {};
+  console.log("--- Step 6: Finalizing Quiz ---");
+
+  const supabase = supabaseClient(state.user_token);
+
+  // Update Status
+  await supabase
+    .from("quizzes")
+    .update({ status: "ready" })
+    .eq("id", state.quiz_id);
+
+  // Link Word Lists
+  if (state.word_list_ids && state.word_list_ids.length > 0) {
+    const links = state.word_list_ids.map(id => ({
+      quiz_id: state.quiz_id,
+      word_list_id: id
+    }));
+    await supabase.from("quiz_word_lists").insert(links);
+  }
+
+  return {};
+}
+
+// --- Graph Definition ---
 
 const workflow = new StateGraph<AgentState>({
   channels: {
@@ -315,40 +316,111 @@ const workflow = new StateGraph<AgentState>({
 workflow.addNode("fetch_words", fetchWordsNode);
 workflow.addNode("pick_article", pickArticleNode);
 workflow.addNode("scrape_content", scrapeContentNode);
-workflow.addNode("generate_quiz", generateQuizNode);
-workflow.addNode("save_to_db", saveToDbNode);
+workflow.addNode("trigger_worker", triggerWorkerNode);
+workflow.addNode("check_status", checkStatusNode);
+workflow.addNode("wait_node", waitNode);
+workflow.addNode("finalize_quiz", finalizeQuizNode);
 
 workflow.addEdge("__start__", "fetch_words");
 workflow.addEdge("fetch_words", "pick_article");
 workflow.addEdge("pick_article", "scrape_content");
-workflow.addEdge("scrape_content", "generate_quiz");
-workflow.addEdge("generate_quiz", "save_to_db");
-workflow.addEdge("save_to_db", "__end__");
+workflow.addEdge("scrape_content", "trigger_worker");
+workflow.addEdge("trigger_worker", "check_status");
+workflow.addEdge("finalize_quiz", "__end__");
+
+// After Waiting (Resume), Check if content was filled
+workflow.addEdge("wait_node", "check_status");
+
+// Conditional Edge Logic for Polling
+workflow.addConditionalEdges(
+  "check_status",
+  (state) => {
+    if (state.error) return "finalize_quiz"; // Proceed to end (or error handler)
+    if (state.generated_quiz) return "finalize_quiz"; // Done
+    return "wait_node"; // Interrupt and cycle back
+  },
+  {
+    finalize_quiz: "finalize_quiz",
+    wait_node: "wait_node"
+  }
+);
 
 const app = workflow.compile({ checkpointer });
 
-// --- Server ---
+// --- HTTP Handler ---
+
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: { "Access-Control-Allow-Origin": "*" } });
+  if (req.method === "OPTIONS")
+    return new Response("ok", { headers: { "Access-Control-Allow-Origin": "*" } });
 
   try {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) throw new Error("Missing Authorization header");
-
-    // Extract just the token string (remove "Bearer ")
     const token = authHeader.replace("Bearer ", "");
-
-    // We pass the auth header globally so RLS policies in the DB work automatically.
     const supabase = supabaseClient(token);
 
-    // 4. Validate User Explicitly
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (!user) throw new Error("Unauthorized: " + authError);
 
     const body = await req.json();
-    const word_list_ids = body.word_list_ids || [];
 
-    // Thread ID tied to User
+    // --- Mode 1: Poll Existing Threads ---
+    if (body.thread_ids && Array.isArray(body.thread_ids)) {
+      const results = [];
+
+      for (const threadId of body.thread_ids) {
+        console.log('here1:', threadId);
+        // We only try to resume threads that belong to this user (the threadID convention helps, or Supabase Checkpointer RLS)
+        if (!threadId.startsWith(user.id)) {
+           results.push({ thread_id: threadId, status: "forbidden" });
+           continue;
+        }
+        console.log('user checks out');
+
+        const config = { configurable: { thread_id: threadId } };
+
+        // Check current state
+        const stateSnapshot = await app.getState(config);
+        console.log('stateSnapshot:', stateSnapshot);
+
+        // If graph is finished or error
+        if (!stateSnapshot.next || stateSnapshot.next.length === 0) {
+          console.log("graph is already finished");
+           results.push({
+             thread_id: threadId,
+             status: "completed",
+             result: stateSnapshot.values
+           });
+           continue;
+        }
+
+        // If graph is interrupted (tasks exist), we resume it to Poll the DB again
+        if (stateSnapshot.tasks && stateSnapshot.tasks.length > 0) {
+          console.log(`Resuming thread ${threadId} to check status...`);
+
+          // Resume by sending a Command with `resume: null`.
+          // This breaks the interrupt in `checkStatusNode` and allows the Conditional Edge to loop it back.
+          console.log('invoking graph');
+          const result = await app.invoke(new Command({ resume: "poll" }), config);
+
+          // Determine status based on result (is it done now?)
+          const finalState = await app.getState(config);
+          const isDone = !finalState.next || finalState.next.length === 0;
+
+          results.push({
+            thread_id: threadId,
+            status: isDone ? "completed" : "processing",
+            result: isDone ? finalState.values : null
+          });
+        }
+      }
+
+      return new Response(JSON.stringify({ data: results }), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // --- Mode 2: Start New Graph ---
+    console.log('starting new graph, body:', body);
+    const word_list_ids = body.word_list_ids || [];
     const threadId = `${user.id}-${Date.now()}`;
     const config = { configurable: { thread_id: threadId } };
 
@@ -359,15 +431,19 @@ Deno.serve(async (req) => {
       target_words: [],
     };
 
-    const result = await app.invoke(initialState, config);
+    // Run until the first interrupt (at check_status)
+    console.log('invoking graph');
+    await app.invoke(initialState, config);
 
+    // Return the thread_id so the client can poll later
+    console.log(`returning thread_id=${threadId} for later polling..`);
     return new Response(JSON.stringify({
-      status: "success",
-      run_id: threadId,
-      data: result
+      status: "started",
+      thread_id: threadId
     }), { headers: { "Content-Type": "application/json" } });
 
   } catch (err: any) {
+    console.error(err);
     return new Response(JSON.stringify({ error: err.message }), { status: 500 });
   }
 });

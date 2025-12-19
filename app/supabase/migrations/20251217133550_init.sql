@@ -27,7 +27,7 @@ CREATE TABLE quizzes (
 
   -- The Quiz Content (JSONB)
   -- Example: [{"question": "...", "answer": "...", "options": [...]}]
-  content JSONB NOT NULL DEFAULT '[]'::jsonb,
+  content JSONB DEFAULT NULL,
 
   created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
