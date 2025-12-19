@@ -51,7 +51,7 @@ Deno.serve(async (req) => {
     const payload = await req.json();
 
     // Payload expected: { title: "...", questions: [...], word_list_ids: [] }
-    if (!payload.questions || !Array.isArray(payload.questions)) {
+    if (payload.questions && !Array.isArray(payload.questions)) {
       throw new Error("Invalid payload: 'questions' must be an array.");
     }
 

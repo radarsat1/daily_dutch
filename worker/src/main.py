@@ -80,6 +80,21 @@ async def generate_quiz(request: QuizRequest):
         return result
     except Exception as e:
         print(e)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                request.webhook,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + request.user_token,
+                },
+                json={
+                    'user_id': request.user_id,
+                    'quiz_id': request.quiz_id,
+                    'questions': None,
+                    'status': 'error'
+                }
+            )
+            print(response.json())
         return {"error": str(e)}
 
 def save_to_db_node(quiz: QuizResponse):

@@ -1,5 +1,6 @@
 "use client";
 
+import { supabase } from '@/utils/supabase'
 import React, { createContext, useContext, useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 
@@ -22,7 +23,7 @@ const QuizJobContext = createContext<QuizJobContextType | undefined>(undefined);
 export function QuizJobProvider({ children }: { children: React.ReactNode }) {
   const [threads, setThreads] = useState<string[]>([]);
   const router = useRouter();
-  
+
   // Ref to track if a poll is currently 'in flight' to prevent overlapping calls
   const isPollingRef = useRef(false);
 
@@ -46,44 +47,40 @@ export function QuizJobProvider({ children }: { children: React.ReactNode }) {
       try {
         console.log("Polling threads:", threads);
 
-        // Call your Edge Function
-        const res = await fetch("/api/generate_quiz", { // Proxy to your edge function
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          // Send the list of IDs to check
-          body: JSON.stringify({ thread_ids: threads }),
-        });
+        // Ccontinue the graph for all threads.
+        const { data, error } = await supabase.functions.invoke('generate-quiz', {
+          body: { thread_ids: threads }
+        })
 
-        if (!res.ok) throw new Error("Poll failed");
+        if (error) throw new Error("Poll failed");
 
-        const json = await res.json();
-        const results: PollResponseItem[] = json.data;
+        const results: PollResponseItem[] = data.data;
 
         // 3. Determine which threads are finished
         const finishedIds: string[] = [];
         let hasSuccess = false;
 
-        results.forEach((job) => {
+        for (const job of results) {
           if (job.status === "completed" || job.status === "error") {
             finishedIds.push(job.thread_id);
-            
+
             if (job.status === "completed") {
                 hasSuccess = true;
                 console.log("Quiz Ready:", job.result);
                 // Optional: Trigger a Toast notification here
             }
           }
-        });
+        };
 
         // 4. Update State: Remove finished threads
         if (finishedIds.length > 0) {
           setThreads((prev) => prev.filter((id) => !finishedIds.includes(id)));
-          
+
           // 5. MAGIC: Refresh Server Components
-          // If we had a success, tell Next.js to re-fetch server data 
+          // If we had a success, tell Next.js to re-fetch server data
           // (i.e. your QuizList component will re-render with the new row from DB)
           if (hasSuccess) {
-            router.refresh(); 
+            router.refresh();
           }
         }
 

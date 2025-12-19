@@ -242,14 +242,16 @@ async function triggerWorkerNode(state: AgentState): Promise<Partial<AgentState>
 
 // checks DB, updates state, returns
 async function checkStatusNode(state: AgentState): Promise<Partial<AgentState>> {
+  if (state.error || !state.article_text) return {};
   console.log(`--- Checking Status for Quiz ${state.quiz_id} ---`);
-  
+
   const supabase = supabaseClient(state.user_token);
   const { data, error } = await supabase
     .from("quizzes")
     .select("content, status, created_at")
     .eq("id", state.quiz_id)
     .single();
+  console.log(`quiz ${state.quiz_id} has status ${data.status}`);
 
   if (error) return { error: error.message };
   
@@ -384,7 +386,6 @@ Deno.serve(async (req) => {
 
         // Check current state
         const stateSnapshot = await app.getState(config);
-        console.log('stateSnapshot:', stateSnapshot);
 
         // If graph is finished or error
         if (!stateSnapshot.next || stateSnapshot.next.length === 0) {
@@ -401,9 +402,6 @@ Deno.serve(async (req) => {
         if (stateSnapshot.tasks && stateSnapshot.tasks.length > 0) {
           console.log(`Resuming thread ${threadId} to check status...`);
 
-          // Resume by sending a Command with `resume: null`.
-          // This breaks the interrupt in `checkStatusNode` and allows the Conditional Edge to loop it back.
-          console.log('invoking graph');
           const result = await app.invoke(new Command({ resume: "poll" }), config);
 
           // Determine status based on result (is it done now?)

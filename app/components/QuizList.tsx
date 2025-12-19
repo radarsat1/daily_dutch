@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { supabase } from '@/utils/supabase'
 import { Database } from '@/lib/schema'
+import { useQuizJob } from "@/components/QuizJobProvider";
 
 // Update Type Definition based on Hybrid Schema
 type QuizRow = Database['public']['Tables']['quizzes']['Row']
@@ -24,6 +25,7 @@ export default function QuizList({ onSelectQuiz }: QuizListProps) {
   const [selectedLists, setSelectedLists] = useState<number[]>([])
   const [loading, setLoading] = useState(true)
   const [generating, setGenerating] = useState(false)
+  const { trackJob } = useQuizJob();
 
   const fetchQuizzes = async () => {
     // 1. Fetch Quizzes with their Attempts (History)
@@ -73,6 +75,9 @@ export default function QuizList({ onSelectQuiz }: QuizListProps) {
       if (error) {
         throw new Error(err.error || 'Failed to generate quiz')
       }
+
+      // Hand off the thread_id to the global poller
+      trackJob(data.thread_id);
 
       // Refresh the list to show the new quiz
       await fetchQuizzes()
