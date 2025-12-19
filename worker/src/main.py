@@ -5,9 +5,8 @@ import json
 import httpx
 from typing import List, TypedDict, Optional, Annotated
 from datetime import datetime
-# from bs4 import BeautifulSoup
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from pydantic import BaseModel
 
 from langchain.chat_models import init_chat_model
@@ -37,11 +36,13 @@ class QuizQuestion(BaseModel):
 class QuizResponse(BaseModel):
     exercises: list[QuizQuestion]
 
-from fastapi import Request
-@app.post('/generate_quiz')
-async def generate_quiz(request: QuizRequest):
-    """Calls an LLM to generate the quiz exercises."""
+async def process_quiz_generation(request: QuizRequest):
+    """
+    Background task that calls the LLM and sends the result via webhook.
+    """
+    print(f"Starting background task for Quiz ID: {request.quiz_id}")
 
+    # Initialize LLM (Note: Ensure this is thread-safe or created per request like here)
     llm = init_chat_model(
         'local-model',
         model_provider='openai',
@@ -50,6 +51,7 @@ async def generate_quiz(request: QuizRequest):
     ).with_structured_output(QuizResponse)
 
     try:
+        # Reconstruct messages from the raw prompt dictionary
         messages = [
             {'role': {'HumanMessage': 'user',
                       'AIMessage': 'chatbot',
@@ -58,11 +60,17 @@ async def generate_quiz(request: QuizRequest):
              }
             for m in request.prompt['kwargs']['messages']
         ]
-        result = llm.invoke(messages)
+
+        # Invoke LLM
+        result = await llm.ainvoke(messages) # Changed to async invoke (ainvoke) for better async performance
 
         # Send webhook to save the results
         async with httpx.AsyncClient() as client:
-            print(result.model_dump()['exercises'])
+            print(f"Quiz {request.quiz_id} generated. Sending webhook...")
+
+            # Extract data safely
+            exercises_data = result.model_dump()['exercises'] if hasattr(result, 'model_dump') else result.dict()['exercises']
+
             response = await client.post(
                 request.webhook,
                 headers={
@@ -72,54 +80,53 @@ async def generate_quiz(request: QuizRequest):
                 json={
                     'user_id': request.user_id,
                     'quiz_id': request.quiz_id,
-                    'questions': result.model_dump()['exercises']
-                }
+                    'questions': exercises_data,
+                    'status': 'completed'
+                },
+                timeout=30.0 # Good practice to have a timeout
             )
-            print(response.json())
+            print(f"Webhook response: {response.status_code} - {response.text}")
 
-        return result
     except Exception as e:
-        print(e)
+        print(f"Error processing quiz {request.quiz_id}: {e}")
+        # Send error webhook
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                request.webhook,
-                headers={
-                    'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + request.user_token,
-                },
-                json={
-                    'user_id': request.user_id,
-                    'quiz_id': request.quiz_id,
-                    'questions': None,
-                    'status': 'error'
-                }
-            )
-            print(response.json())
-        return {"error": str(e)}
+            try:
+                response = await client.post(
+                    request.webhook,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + request.user_token,
+                    },
+                    json={
+                        'user_id': request.user_id,
+                        'quiz_id': request.quiz_id,
+                        'questions': None,
+                        'status': 'error',
+                        'error_details': str(e)
+                    },
+                    timeout=30.0
+                )
+                print(f"Error webhook sent: {response.json()}")
+            except Exception as hook_err:
+                print(f"Failed to send error webhook: {hook_err}")
 
-def save_to_db_node(quiz: QuizResponse):
-    """Saves the final result to the business database."""
-    if state.get("error") or not state.get("exercises"):
-        print(f"Skipping save due to error: {state.get('error')}")
-        return {}
 
-    print("--- Step 4: Saving to Database ---")
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+@app.post('/generate_quiz')
+async def generate_quiz(request: QuizRequest, background_tasks: BackgroundTasks):
+    """
+    Accepts the request and schedules the generation in the background.
+    Returns immediately.
+    """
+    # Add the heavy lifting to background tasks
+    background_tasks.add_task(process_quiz_generation, request)
 
-        json_data = json.dumps(state["exercises"], ensure_ascii=False)
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        cursor.execute(
-            "INSERT INTO daily_exercises (date, source_url, exercises_json) VALUES (?, ?, ?)",
-            (today, state['article_url'], json_data)
-        )
-        conn.commit()
-        conn.close()
-        return {"error": None} # Success
-    except Exception as e:
-        return {"error": str(e)}
+    # Respond immediately to the caller
+    return {
+        "status": "processing",
+        "message": "Quiz generation started in background.",
+        "quiz_id": request.quiz_id
+    }
 
 if __name__ == "__main__":
     import uvicorn
