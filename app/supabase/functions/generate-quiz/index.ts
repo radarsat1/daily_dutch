@@ -211,13 +211,29 @@ async function generateQuizNode(state: AgentState): Promise<Partial<AgentState>>
   const chain = prompt.pipe(llm);
 
   try {
-    const result = await chain.invoke({
+    const result = await prompt.invoke({
       article_text: state.article_text,
       target_words: state.target_words.join(", "),
       num_sentences: NUM_SENTENCES,
       subset_sentences: parseInt(NUM_SENTENCES*3/4),
     });
-    return { generated_quiz: result as QuizQuestion[] };
+
+    // Make a request to our worker service to call the LLM on our behalf
+    const result2 = await fetch('http://host.docker.internal:3001/generate_quiz', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({'prompt': result.toJSON(), 'quiz_id': 0})  // TODO quiz_id
+    });
+
+    // TODO: interrupt LangGraph here and return, allow the client to resume the graph at
+    // this point once the worker has written to the database. Note that this will require
+    // writing an empty quiz to the database first in order to get a quiz_id, then we'll
+    // expect the worker to fill it in. (Or we could do that through an authenticated edge
+    // function.)
+
+    return { generated_quiz: await result2.json() as QuizQuestion[] };
   } catch (e: any) {
     return { error: e.message };
   }

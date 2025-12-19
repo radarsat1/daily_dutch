@@ -1,0 +1,9 @@
+[project]
+name = "quiz-worker"
+version = "0.1.0"
+description = "Generates quizzes and saves them to Supabase"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.124.0",
+    "uvicorn>=0.38.0",
+]
