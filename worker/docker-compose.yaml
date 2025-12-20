@@ -1,0 +1,87 @@
+services:
+  app:
+    build: .
+    container_name: worker
+    restart: unless-stopped
+    expose:
+      - "3001"
+    environment:
+      - ENVIRONMENT=${DOCKER_ENV}
+    labels:
+      - "traefik.enable=true"
+      # Tell Traefik which port the container listens on internally
+      - "traefik.http.services.app.loadbalancer.server.port=3001"
+      
+      # --- Router Logic ---
+      # We define the router rule based on the DOMAIN_NAME in .env
+      - "traefik.http.routers.app.rule=Host(`${DOMAIN_NAME}`)"
+      # We inject the specific entrypoint (local port 8000 or prod port 443)
+      - "traefik.http.routers.app.entrypoints=${TRAEFIK_ENTRYPOINT}"
+      # We toggle TLS (HTTPS) on or off
+      - "traefik.http.routers.app.tls=${TRAEFIK_TLS}"
+      # If TLS is on, use the Let's Encrypt resolver defined in Traefik
+      - "traefik.http.routers.app.tls.certresolver=le_route53"
+
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik_proxy
+    restart: unless-stopped
+    # Pass AWS Credentials for Route 53 DNS Challenge
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-eu-central-1}
+    ports:
+      - "80:80"       # HTTP (Redirect to HTTPS in prod)
+      - "443:443"     # HTTPS
+      - "8000:8000"   # Local Dev Port
+      - "8080:8080"   # Traefik Dashboard (optional)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+    command:
+      # -- Global --
+      - "--log.level=INFO"
+      - "--api.insecure=true" # Enable Dashboard on 8080
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+
+      # -- Entrypoints --
+      # 1. Web (HTTP) - Redirects to WebSecure in prod
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      # 2. WebSecure (HTTPS)
+      - "--entrypoints.websecure.address=:443"
+      # 3. Local (Dev)
+      - "--entrypoints.local.address=:8000"
+
+      # -- Certificates / Let's Encrypt (Route 53) --
+      # We define this always, but it only activates if a router requests it
+      - "--certificatesresolvers.le_route53.acme.dnschallenge=true"
+      - "--certificatesresolvers.le_route53.acme.dnschallenge.provider=route53"
+      # Staging server is better for testing to avoid rate limits. 
+      # Comment out 'caserver' line below for actual Production.
+      # - "--certificatesresolvers.le_route53.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      - "--certificatesresolvers.le_route53.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le_route53.acme.storage=/letsencrypt/acme.json"
+
+  dns-updater:
+    image: amazon/aws-cli
+    container_name: dns_updater
+    # Only run this in production
+    profiles: ["prod"]
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_HOSTED_ZONE_ID=${AWS_HOSTED_ZONE_ID}
+      - DOMAIN_NAME=${DOMAIN_NAME}
+    volumes:
+      - ./scripts/update_dns.sh:/update_dns.sh
+    entrypoint: ["/bin/bash", "-c"]
+    # We install curl, run the script, and then the container stops successfully.
+    command:
+      - |
+        yum install -y curl
+        /update_dns.sh
